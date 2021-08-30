@@ -178,14 +178,10 @@ namespace Tralala
 			if (!g_SmoothCam || !g_SmoothCam->IsCameraEnabled() || g_SmoothCam->GetCameraOwner() != g_pluginHandle)
 				return;
 
-			auto cameraNi = camera->GetNiCamera();
-			if (cameraNi)
-			{
-				g_SmoothCam->SendToGoalPosition(
-					g_pluginHandle, true, true, reinterpret_cast<const ::TESObjectREFR*>(player), cameraNi
-				);
-				tps->camPos = { 0.0f, 0.0f, 0.0f };
-			}
+			g_SmoothCam->SendToGoalPosition(
+				g_pluginHandle, true, true, reinterpret_cast<::Actor*>(player)
+			);
+			tps->camPos = { 0.0f, 0.0f, 0.0f };
 		}
 
 		// Finish ACC's camera mode and setup blending back to SmoothCam
@@ -201,13 +197,9 @@ namespace Tralala
 			if (camera->IsCameraThirdPerson())
 			{
 				// Set SC to it's goal position and begin requesting interpolation updates
-				auto cameraNi = camera->GetNiCamera();
-				if (cameraNi)
-				{
-					g_SmoothCam->SendToGoalPosition(
-						g_pluginHandle, true, true, reinterpret_cast<const ::TESObjectREFR*>(player), cameraNi
-					);
-				}
+				g_SmoothCam->SendToGoalPosition(
+					g_pluginHandle, true, true, reinterpret_cast<::Actor*>(player)
+				);
 				g_SmoothCam->RequestInterpolatorUpdates(g_pluginHandle, true);
 				didEndDialogue = true;
 			}
