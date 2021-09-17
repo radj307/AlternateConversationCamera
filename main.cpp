@@ -15,10 +15,15 @@
 #include "ScaleformUtils.h"
 #include "Havok.h"
 
+#define SMOOTHCAM_API_SKSE
+#include "SmoothCamAPI.h"
+
 #include <shlobj.h>
 
-IDebugLog				gLog;
-PluginHandle			g_pluginHandle = kPluginHandle_Invalid;
+IDebugLog						gLog;
+PluginHandle					g_pluginHandle = kPluginHandle_Invalid;
+SmoothCamAPI::IVSmoothCam2*		g_SmoothCam = nullptr;
+SKSEMessagingInterface*			g_Messaging = nullptr;
 
 void * g_moduleHandle = nullptr;
 
@@ -43,6 +48,7 @@ uintptr_t g_thirdCamHeightAddr = 0;
 uintptr_t g_thirdCamColAddr = 0;
 uintptr_t g_thirdCamUpdateAddr = 0;
 uintptr_t g_camCollisionAddr = 0;
+
 
 void MainGetAddresses()
 {
@@ -124,6 +130,180 @@ namespace Tralala
 
 	Actor* g_refTarget = nullptr;
 
+	// State for SmoothCam interoperability
+	struct
+	{
+		#pragma push_macro("min")
+		#pragma push_macro("max")
+		#undef min
+		#undef max
+
+		// Set during the intial zoom-in and up to the moment the camera rotates the first time
+		bool didStartDialogue = false;
+		// Set during the zoom-out blend op back to SmoothCam control
+		bool didEndDialogue = false;
+		// Counter for blending to and from SmoothCam
+		float scBlendAccum = 0.0f;
+		// Blend duration (in seconds) for moving between SC<->ACC
+		static constexpr float scBlendDuration = 1.0f;
+
+		// Request camera control from SmoothCam, if given setup blending to ACC if we are going to be in thirdperson
+		bool BeginDialogue(PlayerCamera* camera) noexcept
+		{
+			// Request camera control from SC
+			const auto result = g_SmoothCam->RequestCameraControl(g_pluginHandle);
+			// And if we got it, go on ahead like normal
+			if (!(result == SmoothCamAPI::APIResult::OK || result == SmoothCamAPI::APIResult::AlreadyGiven))
+				return false;
+			
+			if ((camera->IsCameraThirdPerson() && !Settings::bForceFirstPerson) ||
+				(camera->IsCameraFirstPerson() && Settings::bForceThirdPerson))
+			{
+				// If we started in thirdperson and will remain in thirdperson for the conversation, OR,
+				// we are in firstperson but will be forced to thirdperson,
+				// request interpolation updates to continue in SC so we can blend it with our own position later.
+				didStartDialogue = g_SmoothCam->RequestInterpolatorUpdates(g_pluginHandle, true) ==
+					SmoothCamAPI::APIResult::OK;
+				didEndDialogue = false;
+				scBlendAccum = 0.0f;
+			}
+
+			return true;
+		}
+
+		// If we force into thirdperson with SmoothCam, we have to do just a bit of cleanup
+		void SetupFromFirstPerson(PlayerCharacter* player, PlayerCamera* camera,
+			ThirdPersonState* tps) noexcept
+		{
+			if (!g_SmoothCam || !g_SmoothCam->IsCameraEnabled() || g_SmoothCam->GetCameraOwner() != g_pluginHandle)
+				return;
+
+			g_SmoothCam->SendToGoalPosition(
+				g_pluginHandle, true, true, reinterpret_cast<::Actor*>(player)
+			);
+			tps->camPos = { 0.0f, 0.0f, 0.0f };
+		}
+
+		// Finish ACC's camera mode and setup blending back to SmoothCam
+		void EndDialogue(PlayerCharacter* player, PlayerCamera* camera) noexcept
+		{
+			if (!g_SmoothCam || !g_SmoothCam->IsCameraEnabled() || g_SmoothCam->GetCameraOwner() != g_pluginHandle)
+				return;
+
+			didStartDialogue = false;
+			scBlendAccum = 0.0f;
+
+			// Only bother blending back if we are still in thirdperson
+			if (camera->IsCameraThirdPerson())
+			{
+				// Set SC to it's goal position and begin requesting interpolation updates
+				g_SmoothCam->SendToGoalPosition(
+					g_pluginHandle, true, true, reinterpret_cast<::Actor*>(player)
+				);
+				g_SmoothCam->RequestInterpolatorUpdates(g_pluginHandle, true);
+				didEndDialogue = true;
+			}
+		}
+
+		// Blend from SC<->ACC positions
+		void UpdateBlendOp(PlayerCharacter* player, PlayerCamera* camera,
+			ThirdPersonState* tps) noexcept
+		{
+			if (!g_SmoothCam || !g_SmoothCam->IsCameraEnabled() || g_SmoothCam->GetCameraOwner() != g_pluginHandle)
+				return;
+
+			// Blend to ACC
+			if (MenuTopicManager::GetSingleton()->isInDialogueState && g_refTarget && player->parentCell)
+			{
+				// When running SmoothCam, use SmoothCam's camera position for the inital zoom-in position.
+				if (camera->cameraRefHandle == PlayerRefHandle && camera->IsCameraThirdPerson() && didStartDialogue)
+				{
+					// Accumulate delta time, lerp from SC's position to the target position
+					scBlendAccum = std::min(scBlendAccum + *(float*)g_deltaTimeAddr, scBlendDuration);
+					const auto scalar = 1.0f - (scBlendDuration - scBlendAccum) / scBlendDuration;
+					tps->camPos = Blend(
+						g_SmoothCam->GetLastCameraPosition(),
+						tps->camPos,
+						scalar
+					);
+
+					if (scalar >= 1.0f)
+					{
+						// All done
+						g_SmoothCam->RequestInterpolatorUpdates(g_pluginHandle, false);
+						didStartDialogue = false;
+					}
+				}
+
+				return;
+			}
+
+			// Blend to SC
+			if (!MenuTopicManager::GetSingleton()->isInDialogueState && didEndDialogue)
+			{
+				// Accumulate delta time, lerp from ACC's position to the target position
+				scBlendAccum = std::min(scBlendAccum + *(float*)g_deltaTimeAddr, scBlendDuration);
+				const auto scalar = 1.0f - (scBlendDuration - scBlendAccum) / scBlendDuration;
+				tps->camPos = Blend(
+					tps->camPos,
+					g_SmoothCam->GetLastCameraPosition(),
+					scalar
+				);
+
+				if (scalar >= 1.0f)
+				{
+					// All done
+					g_SmoothCam->RequestInterpolatorUpdates(g_pluginHandle, false);
+					g_SmoothCam->ReleaseCameraControl(g_pluginHandle);
+					didEndDialogue = false;
+				}
+			}
+		}
+
+		// End the blend operation if it was still running
+		void ForceEndBlendOp() noexcept
+		{
+			if (g_SmoothCam && (didStartDialogue || didEndDialogue))
+			{
+				g_SmoothCam->RequestInterpolatorUpdates(g_pluginHandle, false);
+				didStartDialogue = didEndDialogue = false;
+			}
+		}
+
+		// On death, release camera control if we own it
+		void OnPlayerDeath() noexcept
+		{
+			if (g_SmoothCam && g_SmoothCam->GetCameraOwner() == g_pluginHandle)
+				g_SmoothCam->ReleaseCameraControl(g_pluginHandle);
+			didStartDialogue = didEndDialogue = false;
+		}
+
+		private:
+		template<typename T>
+		T Blend(const T& from, const T& to, float scalar) const noexcept
+		{
+			if (scalar >= 1.0f) return to;
+			if (scalar <= 0.0f) return from;
+			return from + (to - from) * QuadInOut(scalar);
+		}
+
+		float QuadInOut(float a) const noexcept
+		{
+			if (a < 0.5f)
+			{
+				return 2.0f * a * a;
+			}
+			else
+			{
+				return (-2.0f * a * a) + (4.0f * a) - 1.0f;
+			}
+		}
+
+		#pragma pop_macro("min")
+		#pragma pop_macro("max")
+	} g_scState;
+
+
 	static void SetZoom(float targetFOV)
 	{
 		float mult = roundf(1.0f / *(float*)g_deltaTimeAddr) / 60.0f;
@@ -135,6 +315,7 @@ namespace Tralala
 		g_fovStep = step;
 	}
 
+
 	static void ResetZoom()
 	{
 		float mult = roundf(1.0f / *(float*)g_deltaTimeAddr) / 60.0f;
@@ -145,6 +326,7 @@ namespace Tralala
 		g_firstfovTo = *(float*)g_defaultFirstFOVAddr;
 		g_fovStep = step;
 	}
+
 
 	static bool IsValidFaceToFace(PlayerCamera * camera, Actor** ret)
 	{
@@ -204,6 +386,21 @@ namespace Tralala
 			g_processSwitch = false;
 			g_lock = true;
 
+			if (g_SmoothCam && g_SmoothCam->IsCameraEnabled())
+			{
+				if (!g_scState.BeginDialogue(camera))
+				{
+					g_refTarget = nullptr;
+					return;
+				}
+
+				g_refTarget = actor;
+			}
+			else
+			{
+				g_refTarget = actor;
+			}
+
 			if (camera->IsCameraThirdPerson())
 			{
 				g_zoom = true;
@@ -241,6 +438,7 @@ namespace Tralala
 
 					tps->SetShoulderPos(shoulderPos);
 
+					g_scState.SetupFromFirstPerson(player, camera, tps);
 				}
 			}
 
@@ -258,7 +456,6 @@ namespace Tralala
 
 				g_firstDistance = distance;
 				g_thirdDistance = FLT_MAX;
-				g_refTarget = actor;
 			}
 			else
 			{
@@ -282,12 +479,12 @@ namespace Tralala
 				{
 					g_thirdDistance = 0.0f;
 				}
-
-				g_refTarget = actor;
 			}
 		}
 		else
-		{		
+		{
+			
+			g_scState.EndDialogue(player, camera);
 
 			if (!g_zoom)
 				return;
@@ -802,6 +999,8 @@ namespace Tralala
 			if (Settings::bSwitchTarget)
 				camera->SetCameraTarget(player);
 		}
+
+		g_scState.OnPlayerDeath();
 	}
 
 	// FECKIN' PHYSICS
@@ -932,11 +1131,12 @@ namespace Tralala
 	// TO DO - FIX THE FECKIN' CAMERA COLLISION
 	void TPCamProcessCollision_Hook(ThirdPersonState* tps)
 	{
-		if (!Settings::bSwitchTarget)
-			return tps->ProcessCameraCollision();
-
 		PlayerCharacter* player = PlayerCharacter::GetSingleton();
 		PlayerCamera* camera = (PlayerCamera*)tps->camera;
+
+		g_scState.UpdateBlendOp(player, camera, tps);
+
+		if (!Settings::bSwitchTarget) return tps->ProcessCameraCollision();
 
 		static bool isPCCollided = false;
 		static bool isNPCCollided = false;
@@ -951,20 +1151,19 @@ namespace Tralala
 		{
 			if (camera->cameraRefHandle != PlayerRefHandle)
 			{
+				g_scState.ForceEndBlendOp();
+
 				if (g_refTarget->movementCtrlNPC)
 				{
 					MovementControllerNPC* movementCtrl = g_refTarget->movementCtrlNPC;
-
 					BSFixedString intfc("IMovementSetGoal");
-
 					IMovementInterface* movementIntfc = movementCtrl->QueryMovementInterface(intfc);
+
 					if (movementIntfc)
 					{
 						IMovementSetGoal* setGoal = (IMovementSetGoal*)movementIntfc;
 						UInt32 unkVar = *(UInt32*)(setGoal + 0x6);
-
-						if(unkVar != 3)
-							setGoal->ClearPathingRequest();
+						if (unkVar != 3) setGoal->ClearPathingRequest();
 					}
 				}
 
@@ -973,7 +1172,9 @@ namespace Tralala
 				NiPoint3 targetHeadPos;
 				bool targetHeadPosRet = false;
 				if (!player->GetTargetHeadNodePosition(&targetHeadPos, &targetHeadPosRet))
+				{
 					player->GetMarkerPosition(&targetHeadPos);
+				}
 
 				NiPoint3 headPos;
 				bool headPosRet = true;
@@ -1004,15 +1205,12 @@ namespace Tralala
 					}
 
 	#endif
-				
 					isPCCollided = true;
 				}
 
 				if (isPCCollided)
 				{
-					NiPoint3 offset(Settings::fHumanCamOffsetX, 
-						Settings::fHumanCamOffsetY, 
-						Settings::fHumanCamOffsetZ);
+					NiPoint3 offset(Settings::fHumanCamOffsetX, Settings::fHumanCamOffsetY, Settings::fHumanCamOffsetZ);
 					if (!headPosRet)
 					{
 						offset.x = Settings::fCreatureCamOffsetX;
@@ -1040,8 +1238,7 @@ namespace Tralala
 
 				if (!player->IsSneaking() && player->actorState.IsWeaponDrawn())
 				{
-					if (pcHeight <= 0.0f)
-						pcHeight = targetPos.z - player->pos.z;
+					if (pcHeight <= 0.0f) pcHeight = targetPos.z - player->pos.z;
 
 					targetPos.x = player->pos.x;
 					targetPos.y = player->pos.y;
@@ -1088,9 +1285,7 @@ namespace Tralala
 				if (abs(curDistance - distance) >= 10.0f)
 				{
 					float newFOV = roundf((atanf(Settings::f3rdZoom / distance) * 2.0f) * 180.0f / PI);
-					if (newFOV < 30.0f)
-						newFOV = 30.0f;
-
+					if (newFOV < 30.0f) newFOV = 30.0f;
 					SetZoom(newFOV);
 					curDistance = distance;
 				}
@@ -1113,21 +1308,18 @@ namespace Tralala
 					if (camera->IsInCameraView(&targetPos, PlayerCamera::KRotate_Stop))
 					{
 						constexpr float speed = 1.0f / 90.f;
-
 						diffAngleX = origDiffAngleX * speed * mult;
 						diffAngleZ = origDiffAngleZ * speed * mult;
 					}
 					else if (camera->IsInCameraView(&targetPos, PlayerCamera::kRotate_Slow))
 					{
 						constexpr float speed = 1.0f / 60.f;
-
 						diffAngleX = origDiffAngleX * speed * mult;
 						diffAngleZ = origDiffAngleZ * speed * mult;
 					}
 					else
 					{
 						constexpr float speed = 1.0f / 30.f;
-
 						diffAngleX = origDiffAngleX * speed * mult;
 						diffAngleZ = origDiffAngleZ * speed * mult;
 					}
@@ -1142,7 +1334,6 @@ namespace Tralala
 			}
 			else
 			{
-
 				NiPoint3 targetHeadPos;
 				bool targetHeadPosRet = true;
 				if (!g_refTarget->GetTargetHeadNodePosition(&targetHeadPos, &targetHeadPosRet))
@@ -1165,7 +1356,10 @@ namespace Tralala
 				Havok::hkpRootCdPoint resultInfo;
 				Actor* resultActor = nullptr;
 
-				if (camera->GetClosestPoint(g_refTarget->GetbhkWorldM(), &targetHeadPos, &resultPos, &resultInfo,
+				// Make sure the world is valid before testing - If an actor is deleted during a converstaion, the world
+				// can become null, causing a crash.
+				auto world = g_refTarget->GetbhkWorldM();
+				if (world && camera->GetClosestPoint(world, &targetHeadPos, &resultPos, &resultInfo,
 					&resultActor, 1.0f))
 				{
 	#if 0
@@ -1471,6 +1665,36 @@ namespace Tralala
 
 extern "C"
 {
+	void SKSEMessageHandler(SKSEMessagingInterface::Message* message)
+	{
+		// Request the SmoothCam API, if SmoothCam is installed
+		switch (message->type)
+		{
+			case SKSEMessagingInterface::kMessage_PostLoad:
+				if (!SmoothCamAPI::RegisterInterfaceLoaderCallback(
+					g_Messaging, g_pluginHandle,
+					[](void* interfaceInstance, SmoothCamAPI::InterfaceVersion interfaceVersion) {
+						if (interfaceVersion == SmoothCamAPI::InterfaceVersion::V2) {
+							g_SmoothCam = reinterpret_cast<SmoothCamAPI::IVSmoothCam2*>(interfaceInstance);
+							_MESSAGE("Obtained SmoothCamAPI");
+						} else
+							_MESSAGE("Unable to aquire requested SmoothCamAPI interface version");
+					}
+				)) _MESSAGE("SmoothCamAPI::RegisterInterfaceLoaderCallback reported an error");
+				break;
+
+			case SKSEMessagingInterface::kMessage_PostPostLoad:
+				if (!SmoothCamAPI::RequestInterface(
+					g_Messaging,
+					g_pluginHandle,
+					SmoothCamAPI::InterfaceVersion::V2
+				)) _MESSAGE("SmoothCamAPI::RequestInterface reported an error");
+				break;
+
+			default:
+				break;
+		}
+	}
 
 	bool SKSEPlugin_Query(const SKSEInterface * skse, PluginInfo * info)
 	{
@@ -1517,6 +1741,10 @@ extern "C"
 		Menus::GetAddresses();
 		Graphics::GetAddresses();
 		Havok::GetAddresses();
+
+		g_Messaging = reinterpret_cast<SKSEMessagingInterface*>(skse->QueryInterface(kInterface_Messaging));
+		if (g_Messaging)
+			g_Messaging->RegisterListener(g_pluginHandle, "SKSE", SKSEMessageHandler);
 
 		Settings::Load();
 		{
